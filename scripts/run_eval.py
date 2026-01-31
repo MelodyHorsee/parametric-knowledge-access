@@ -105,7 +105,7 @@ class GPT52Evaluator:
             input=messages
         )
         text = response.output_text
-        token_count = response.usage.total_tokens
+        token_count = response.usage.output_tokens
         return text, token_count
 
 
