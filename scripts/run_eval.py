@@ -97,7 +97,7 @@ class GPT52Evaluator:
             {"role": "user", "content": instruction + " " + question}
         ]
 
-    def generate(self, question, use_cues, use_thinking):
+    def generate(self, question, use_cues, use_thinking, **kwargs):
         messages = self.build_prompt(question, use_cues)
         response = self.client.responses.create(
             model=self.model_name,
@@ -105,7 +105,7 @@ class GPT52Evaluator:
             input=messages
         )
         text = response.output_text
-        token_count = response.usage.output_tokens
+        token_count = response.usage.total_tokens
         return text, token_count
 
 
@@ -416,6 +416,16 @@ def load_dataset(dataset_name):
                 "question": row["problem"],
                 "answer_aliases": [row["answer"]]
             })
+    elif dataset_name == "strategyqa":
+        strategyqa_path = "StrategyQA/strategyqa_train.json"
+        with open(strategyqa_path) as f:
+            raw_data = json.load(f)
+        sample = []
+        for item in raw_data:
+            sample.append({
+                "question": item["question"],
+                "answer_aliases": ["true"] if item["answer"] else ["false"]
+            })
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -662,8 +672,8 @@ def main():
                         choices=["gpt-5.2", "gpt-oss-20b", "olmo-3-7b-think", "r1-distill-qwen-1.5b"],
                         help="Model to evaluate")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["triviaqa", "nq", "hotpotqa", "simpleqa"],
-                        help="Dataset to use")
+                        choices=["triviaqa", "nq", "hotpotqa", "simpleqa", "strategyqa", "all"],
+                        help="Dataset to use ('all' to run on all 5 datasets)")
     parser.add_argument("--cues", type=str, default="no",
                         choices=["yes", "no"],
                         help="Use thinking cues (think step-by-step)")
@@ -690,17 +700,20 @@ def main():
     # Create output directory
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    run_evaluation(
-        model_name=args.model,
-        dataset_name=args.dataset,
-        use_cues=use_cues,
-        use_thinking=use_thinking,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        output_dir=args.output_dir,
-        checkpoint_uri=args.checkpoint_uri,
-        inference_name=args.inference_name
-    )
+    datasets = ["triviaqa", "nq", "hotpotqa", "simpleqa", "strategyqa"] if args.dataset == "all" else [args.dataset]
+
+    for dataset_name in datasets:
+        run_evaluation(
+            model_name=args.model,
+            dataset_name=dataset_name,
+            use_cues=use_cues,
+            use_thinking=use_thinking,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            output_dir=args.output_dir,
+            checkpoint_uri=args.checkpoint_uri,
+            inference_name=args.inference_name
+        )
 
 
 if __name__ == "__main__":

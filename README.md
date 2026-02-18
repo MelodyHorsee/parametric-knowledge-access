@@ -36,11 +36,12 @@ export TINKER_API_KEY="your-tinker-key"
 
 | Script | Description |
 |--------|-------------|
-| `run_eval.py` | Evaluate on TriviaQA, Natural Questions, HotpotQA, SimpleQA |
+| `run_eval.py` | Evaluate on TriviaQA, Natural Questions, HotpotQA, SimpleQA, StrategyQA |
 | `run_eval_math.py` | Evaluate on MATH |
 | `Ex-Recall.py` | Refine model answer using GPT-5-mini |
+| `extract_thinking_tokens.py` | Extract and analyze thinking token counts from evaluation results |
 | `bootstrap_ci.py` | Bootstrap confidence intervals on two results trace files |
-| `sft_train.py` | SFT training on GPT-OSS-20B |
+| `reasoningsft_train.py` | SFT / Reasoning-SFT training on GPT-OSS-20B |
 | `/rl` | RL training on GPT-OSS-20B |
 
 ## Datasets
@@ -49,6 +50,7 @@ export TINKER_API_KEY="your-tinker-key"
 - **Natural Questions**: Requires `NQ/NQ-open.dev.jsonl` ([download](https://github.com/efficientqa/nq-open))
 - **HotpotQA**: Auto-downloaded from HuggingFace (`hotpotqa/hotpot_qa`)
 - **SimpleQA**: Auto-downloaded from OpenAI blob storage
+- **StrategyQA**: Requires `StrategyQA/strategyqa_train.json` ([download](https://github.com/eladsegal/strategyqa))
 - **MATH**: Auto-downloaded from HuggingFace (`EleutherAI/hendrycks_math`)
 
 ## Models
@@ -71,7 +73,7 @@ export TINKER_API_KEY="your-tinker-key"
   - Choices: `gpt-5.2`, `gpt-oss-20b`, `olmo-3-7b-think`, `r1-distill-qwen-1.5b`
 
 - `--dataset`: Dataset to use (run_eval.py only)
-  - Choices: `triviaqa`, `nq`, `hotpotqa`, `simpleqa`
+  - Choices: `triviaqa`, `nq`, `hotpotqa`, `simpleqa`, `strategyqa`, `all`
 
 - `--cues`: Use thinking cues ("Think step-by-step")
   - Choices: `yes`, `no`
@@ -157,40 +159,18 @@ python run_eval_math.py \
 | `--checkpoint_uri` | Tinker URI to the checkpoint weights |
 | `--inference_name` | Optional name for the model checkpoint |
 
-### Using a Shell Script
-
-```bash
-#!/bin/bash
-python run_eval.py \
-    --model "gpt-oss-20b" \
-    --dataset "triviaqa" \
-    --cues "no" \
-    --thinking "yes" \
-    --temperature 1 \
-    --top_p 1 \
-    --output_dir "results/TriviaQA/gpt-oss-20b"
-```
-
 ## Output Files
 
 Results are saved with the naming convention:
 
-**Knowledge-access (run_eval.py):**
 - GPT-5.2: `{dataset}_{model}_{cues}.json`
 - Other models: `{dataset}_{model}_{cues}_{thinking}.json`
 - With checkpoint: `{dataset}_{model}_{inference_name}_{cues}_{thinking}.json`
-
-**MATH (run_eval_math.py):**
-- GPT-5.2: `math_{model}_{cues}.json`
-- Other models: `math_{model}_{cues}_{thinking}.json`
-- With checkpoint: `math_{model}_{inference_name}_{cues}_{thinking}.json`
 
 Examples:
 - `triviaqa_gpt52_no_cues.json`
 - `triviaqa_gptoss20b_no_cues_with_thinking.json`
 - `triviaqa_gptoss20b_checkpoint1240_no_cues_with_thinking.json`
-- `math_gptoss20b_no_cues_with_thinking.json`
-- `math_gptoss20b_checkpoint1240_no_cues_with_thinking.json`
   
 **Note:** Two TriviaQA result files for Olmo-3-7B-Think (`triviaqa_olmo3_no_cues_with_thinking.json` and `triviaqa_olmo3_with_cues_with_thinking.json`) are too large and thus are not included in this repository.
 
@@ -206,13 +186,115 @@ Each output file contains:
 **MATH metrics:**
 - `accuracy`: Proportion of correct answers
 
-## Evaluation Metrics
+---
 
-- **Exact Match (EM)**: Prediction exactly matches ground truth after normalization
-- **Recall**: Ground truth appears in prediction after normalization
-- **Token Statistics**: Token length per response
+# Thinking Token Analysis
+
+`extract_thinking_tokens.py` extracts thinking token counts from evaluation results and compares token usage between correctly (recalled) and incorrectly answered (not recalled) questions.
+
+## Usage
+
+```bash
+# Single file (auto-detects model type from filename)
+python scripts/extract_thinking_tokens.py results/TriviaQA/gpt-oss-20b/triviaqa_gptoss20b_no_cues_with_thinking.json
+
+# Entire directory (recursively processes all result files)
+python scripts/extract_thinking_tokens.py results/
+
+# Save aggregated stats to JSON
+python scripts/extract_thinking_tokens.py results/ --output thinking_stats.json
+
+# Skip tokenizer (use character counts instead)
+python scripts/extract_thinking_tokens.py results/ --no-tokenizer
+```
+
+## Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `input` | Path to a results JSON file or directory |
+| `--model-type` | Model type (`gpt-oss-20b`, `olmo`, `r1-qwen`). Auto-detected from filename if not specified |
+| `--no-tokenizer` | Skip tokenizer, only compute character counts |
+| `--output` | Output file path for aggregated stats JSON |
+
+## Output
+
+For each file, reports:
+- Total samples and average thinking tokens
+- Average thinking tokens for correct vs incorrect answers
+
+The script automatically pairs result files with their corresponding `ex_` refined recall files (from `Ex-Recall.py`) when available.
 
 ---
+
+# SFT / Reasoning-SFT Training
+
+Script for supervised fine-tuning GPT-OSS-20B on TriviaQA, supporting two modes.
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/reasoningsft_train.py` | SFT and Reasoning-SFT training script |
+
+## Modes
+
+### 1. Direct SFT (without `trajectory_path`)
+
+Trains on TriviaQA with synthetic minimal thinking traces. The model learns to produce `"Need answer: {answer}."` as its reasoning, followed by the answer.
+
+```bash
+python scripts/reasoningsft_train.py \
+    config.batch_size=32 \
+    config.learning_rate=1e-5 \
+    config.num_epochs=8 \
+    config.seed=6 \
+    config.wandb_project=triviaqa-sft
+```
+
+### 2. Reasoning-SFT (with `trajectory_path`)
+
+Trains on correct trajectories from an RL-trained model. The model learns to reproduce full reasoning traces from examples where the RL model answered correctly (recall=True).
+
+```bash
+python scripts/reasoningsft_train.py \
+    config.trajectory_path=path/to/trajectories.json \
+    config.batch_size=32 \
+    config.learning_rate=1e-5 \
+    config.num_epochs=8 \
+    config.seed=6 \
+    config.wandb_project=triviaqa-reasoning-sft
+```
+
+The trajectory file should be a JSON with a `results` array, where each item has `question`, `raw_prediction`, and `recall` fields. Only examples with `recall=True` are used.
+
+## Training Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `model_name` | Base model to train | `openai/gpt-oss-20b` |
+| `lora_rank` | LoRA rank | `32` |
+| `batch_size` | Batch size | `32` |
+| `learning_rate` | Learning rate | `1e-5` |
+| `num_epochs` | Number of epochs | `8` |
+| `max_length` | Max sequence length | `32768` |
+| `seed` | Random seed | `6` |
+| `save_every` | Checkpoint frequency | `100` |
+| `trajectory_path` | Path to correct trajectories JSON (enables Reasoning-SFT) | `None` |
+| `val_path` | Path to validation set for NLL and generation eval | `None` |
+| `eval_every` | Validation NLL eval frequency | `100` |
+| `gen_eval_every` | Generation-based EM/Recall eval frequency | `500` |
+| `nll_threshold` | Only train on examples with NLL below threshold | `None` |
+| `wandb_project` | W&B project name | `triviaqa-sft` |
+| `log_path` | Log directory | Auto-generated |
+
+## Training Format
+
+The assistant message uses two fields for the `gpt_oss_low_reasoning` renderer:
+- **thinking**: Goes to the analysis channel (reasoning trace)
+- **content**: Goes to the final channel (visible output)
+
+In Direct SFT mode, the thinking trace is synthetic: `"Need answer: {answer}."`. In Reasoning-SFT mode, the thinking trace is extracted from the RL model's correct trajectory.
 
 # RL Training
 
@@ -257,66 +339,6 @@ python scripts/rl/train.py \
 
 ---
 
-# SFT Training
-
-Scripts for supervised fine-tuning GPT-OSS-20B on TriviaQA.
-
-## Scripts
-
-| Script | Description |
-|--------|-------------|
-| `scripts/sft/sft_train.py` | Main SFT training script |
-
-## Usage
-
-```bash
-python scripts/sft/sft_train.py \
-    --batch_size 128 \
-    --learning_rate 1e-4 \
-    --num_epochs 1 \
-    --seed 0 \
-    --lora_rank 32 \
-    --save_every 100 \
-    --wandb_project triviaqa-sft
-```
-
-## Training Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--model_name` | Base model to train | `openai/gpt-oss-20b` |
-| `--lora_rank` | LoRA rank | `32` |
-| `--batch_size` | Batch size | `512` |
-| `--learning_rate` | Learning rate | `2e-5` |
-| `--num_epochs` | Number of epochs | `5` |
-| `--max_length` | Max sequence length | `32768` |
-| `--seed` | Random seed | `0` |
-| `--save_every` | Checkpoint frequency | `100` |
-| `--wandb_project` | W&B project name | `triviaqa-sft` |
-| `--log_path` | Log directory | `tmp/triviaqa_sft/...` |
-
-## Training Format
-
-Build your own SFT dataset by modifying the `build_messages()` function in `sft_train.py`:
-
-```python
-def build_messages(question: str, answer: str) -> list[dict]:
-    thinking_trace = f"Need answer: {answer}."
-    formatted_answer = f"The answer is <answer>{answer}</answer>."
-
-    return [
-        {"role": "system", "content": "You will be given a question. Give your final answer in <answer></answer> tags."},
-        {"role": "user", "content": question},
-        {"role": "assistant", "thinking": thinking_trace, "content": formatted_answer},
-    ]
-```
-
-The assistant message uses two fields for the `gpt_oss_low_reasoning` renderer:
-- **thinking**: Goes to the analysis channel (reasoning trace)
-- **content**: Goes to the final channel (visible output)
-
----
-
 # Results
 
 The `results/` directory contains evaluation outputs organized by dataset and model.
@@ -342,6 +364,8 @@ results/
 │   └── r1-distill-qwen-1.5b/
 ├── HotpotQA/
 │   └── gpt-oss-20b/
-└── SimpleQA/
+├── SimpleQA/
+│   └── gpt-oss-20b/
+└── StrategyQA/
     └── gpt-oss-20b/
 ```
