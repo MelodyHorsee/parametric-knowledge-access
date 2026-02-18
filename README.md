@@ -300,6 +300,8 @@ In Direct SFT mode, the thinking trace is synthetic: `"Need answer: {answer}."`.
 
 Scripts for training GPT-OSS-20B with reinforcement learning on TriviaQA.
 
+Our trained model used for evaluation in the paper is available at [melodyhorse/gpt-oss-20b-triviaqa-rl](https://huggingface.co/melodyhorse/gpt-oss-20b-triviaqa-rl).
+
 ## Scripts
 
 | Script | Description |
