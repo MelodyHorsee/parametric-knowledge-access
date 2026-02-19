@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Script to compute paired bootstrap-resample confidence intervals on the difference
-of means between two results trace files.
+Script to perform McNemar's test on paired binary outcomes between two results
+trace files.
 
 This script:
 1. Loads two JSON or JSONL files with results
 2. Pairs results between files (by question/problem text or by index)
-3. Computes paired differences for available metrics
-4. Performs bootstrap resampling to estimate confidence intervals
-5. Reports the mean difference and confidence intervals
+3. Builds the 2×2 McNemar contingency table for each available metric
+4. Applies McNemar's test (with continuity correction; exact binomial for small n)
+5. Reports the test statistic, p-value, and significance
 
 Supports multiple file formats:
 - JSON with 'results' array: {"results": [...]}
@@ -26,6 +26,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple
+from scipy import stats
 
 
 def load_json_file(file_path: str) -> List[Dict]:
@@ -150,70 +151,82 @@ def get_metric_value(result: Dict, metric: str) -> float:
         return 1.0 if result.get(metric, False) else 0.0
 
 
-def compute_paired_differences(pairs: List[Tuple[Dict, Dict]], metric: str) -> np.ndarray:
+def build_contingency_table(pairs: List[Tuple[Dict, Dict]],
+                            metric: str) -> Tuple[int, int, int, int]:
     """
-    Compute paired differences for a given metric.
-    
+    Build the 2×2 McNemar contingency table for a binary metric.
+
+    The four cells are:
+      a = both correct          (file1=1, file2=1)
+      b = only file1 correct    (file1=1, file2=0)
+      c = only file2 correct    (file1=0, file2=1)
+      d = both incorrect        (file1=0, file2=0)
+
     Args:
         pairs: List of (result1, result2) tuples
-        metric: Either 'recall' or 'exact_match' (or 'em')
-    
+        metric: Metric name
+
     Returns:
-        Array of differences (value1 - value2) for each pair
+        (a, b, c, d) counts
     """
-    differences = []
+    a = b = c = d = 0
     for r1, r2 in pairs:
-        val1 = get_metric_value(r1, metric)
-        val2 = get_metric_value(r2, metric)
-        differences.append(val1 - val2)
-    
-    return np.array(differences)
+        v1 = int(get_metric_value(r1, metric))
+        v2 = int(get_metric_value(r2, metric))
+        if v1 == 1 and v2 == 1:
+            a += 1
+        elif v1 == 1 and v2 == 0:
+            b += 1
+        elif v1 == 0 and v2 == 1:
+            c += 1
+        else:
+            d += 1
+    return a, b, c, d
 
 
-def bootstrap_resample(data: np.ndarray, n_bootstrap: int = 10000, 
-                      confidence_level: float = 0.95) -> Tuple[float, float, float]:
+def mcnemar_test(pairs: List[Tuple[Dict, Dict]],
+                 metric: str) -> Dict:
     """
-    Perform bootstrap resampling to compute confidence intervals.
-    
+    Perform McNemar's test on paired binary outcomes.
+
+    Uses the mid-p exact binomial test when b+c < 25 (sparse discordant cells),
+    and the chi-squared approximation with continuity correction otherwise.
+
     Args:
-        data: Array of paired differences
-        n_bootstrap: Number of bootstrap samples
-        confidence_level: Confidence level (e.g., 0.95 for 95% CI)
-    
+        pairs: List of (result1, result2) tuples
+        metric: Metric name
+
     Returns:
-        Tuple of (mean_difference, lower_bound, upper_bound)
+        Dictionary with keys: a, b, c, d, n, statistic, p_value, method
     """
-    n = len(data)
-    if n == 0:
-        raise ValueError("Cannot bootstrap empty data")
-    
-    # Compute observed mean difference
-    observed_mean = np.mean(data)
-    
-    # Bootstrap resampling
-    bootstrap_means = []
-    for _ in range(n_bootstrap):
-        # Resample with replacement
-        bootstrap_sample = np.random.choice(data, size=n, replace=True)
-        bootstrap_mean = np.mean(bootstrap_sample)
-        bootstrap_means.append(bootstrap_mean)
-    
-    bootstrap_means = np.array(bootstrap_means)
-    
-    # Compute confidence interval using percentile method
-    alpha = 1 - confidence_level
-    lower_percentile = (alpha / 2) * 100
-    upper_percentile = (1 - alpha / 2) * 100
-    
-    lower_bound = np.percentile(bootstrap_means, lower_percentile)
-    upper_bound = np.percentile(bootstrap_means, upper_percentile)
-    
-    return observed_mean, lower_bound, upper_bound
+    a, b, c, d = build_contingency_table(pairs, metric)
+    n = a + b + c + d
+    discordant = b + c
+
+    if discordant == 0:
+        # Perfect agreement on discordant pairs — no test possible
+        return dict(a=a, b=b, c=c, d=d, n=n,
+                    statistic=None, p_value=None, method='none')
+
+    if discordant < 25:
+        # Exact binomial test: under H0, b ~ Binomial(b+c, 0.5)
+        # Two-sided p-value
+        p_value = stats.binom_test(b, discordant, 0.5, alternative='two-sided')
+        method = 'exact (binomial)'
+        statistic = None
+    else:
+        # Chi-squared with continuity correction
+        chi2 = (abs(b - c) - 1) ** 2 / discordant
+        p_value = 1 - stats.chi2.cdf(chi2, df=1)
+        method = 'chi-squared (continuity correction)'
+        statistic = chi2
+
+    return dict(a=a, b=b, c=c, d=d, n=n,
+                statistic=statistic, p_value=p_value, method=method)
 
 
-def print_results(metric: str, mean_diff: float, lower_bound: float, upper_bound: float,
-                  n_pairs: int, confidence_level: float = 0.95):
-    """Print formatted results for a metric."""
+def print_results(metric: str, result: Dict, alpha: float = 0.05):
+    """Print formatted McNemar's test results for a metric."""
     if metric == 'recall':
         metric_label = 'Recall'
     elif metric == 'exact_match':
@@ -223,22 +236,41 @@ def print_results(metric: str, mean_diff: float, lower_bound: float, upper_bound
     else:
         metric_label = metric.capitalize()
 
-    confidence_pct = int(confidence_level * 100)
+    a, b, c, d = result['a'], result['b'], result['c'], result['d']
+    n = result['n']
+    p_value = result['p_value']
+    statistic = result['statistic']
+    method = result['method']
+
+    acc1 = (a + b) / n if n > 0 else 0.0
+    acc2 = (a + c) / n if n > 0 else 0.0
 
     print(f"\n{'=' * 80}")
-    print(f"{metric_label} - Paired Bootstrap Confidence Intervals")
+    print(f"{metric_label} — McNemar's Test")
     print(f"{'=' * 80}")
-    print(f"Number of paired examples: {n_pairs}")
-    print(f"Mean difference (File1 - File2): {mean_diff:.6f}")
-    print(f"{confidence_pct}% Confidence Interval: [{lower_bound:.6f}, {upper_bound:.6f}]")
+    print(f"Number of paired examples : {n}")
+    print(f"  File1 rate              : {acc1:.4f}  ({a + b}/{n})")
+    print(f"  File2 rate              : {acc2:.4f}  ({a + c}/{n})")
+    print(f"\nContingency table (File1 \\ File2):")
+    print(f"                 File2 correct   File2 incorrect")
+    print(f"  File1 correct      {a:>6}           {b:>6}   (b)")
+    print(f"  File1 incorrect    {c:>6}   (c)      {d:>6}")
+    print(f"\nDiscordant pairs: b={b}, c={c}  (b+c={b+c})")
+    print(f"Method: {method}")
 
-    # Check if interval contains zero
-    if lower_bound <= 0 <= upper_bound:
-        print(f"  → Interval contains zero: difference is not statistically significant")
-    elif mean_diff > 0:
-        print(f"  → File1 has significantly higher {metric_label.lower()} (p < {1-confidence_level:.3f})")
+    if p_value is None:
+        print("  → b+c = 0: both systems agree on every example; test not applicable.")
     else:
-        print(f"  → File2 has significantly higher {metric_label.lower()} (p < {1-confidence_level:.3f})")
+        if statistic is not None:
+            print(f"χ²  = {statistic:.4f}")
+        print(f"p   = {p_value:.6f}")
+        if p_value < alpha:
+            winner = "File1" if b > c else "File2"
+            print(f"  → Significant difference at α={alpha}: {winner} performs better "
+                  f"(p={p_value:.4f} < {alpha})")
+        else:
+            print(f"  → No significant difference at α={alpha} "
+                  f"(p={p_value:.4f} ≥ {alpha})")
 
     print(f"{'=' * 80}")
 
@@ -278,8 +310,8 @@ def compute_summary_stats(results: List[Dict], file_name: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute paired bootstrap-resample confidence intervals on the "
-                    "difference of means of recall/EM between two results trace files."
+        description="Perform McNemar's test on paired binary outcomes "
+                    "(recall/EM/accuracy) between two results trace files."
     )
     parser.add_argument(
         "input_file1",
@@ -292,35 +324,19 @@ def main():
         help="Path to the second JSON file containing reasoning traces"
     )
     parser.add_argument(
-        "--n-bootstrap",
-        type=int,
-        default=10000,
-        help="Number of bootstrap samples (default: 10000)"
-    )
-    parser.add_argument(
-        "--confidence-level",
+        "--alpha",
         type=float,
-        default=0.95,
-        help="Confidence level for intervals (default: 0.95 for 95% CI)"
+        default=0.05,
+        help="Significance level α (default: 0.05)"
     )
     parser.add_argument(
         "--pair-by-index",
         action="store_true",
         help="Pair results by index instead of by question text (default: pair by question)"
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed for reproducibility (default: None)"
-    )
-    
+
     args = parser.parse_args()
-    
-    # Set random seed if provided
-    if args.seed is not None:
-        np.random.seed(args.seed)
-    
+
     # Load both files
     print(f"Reading {args.input_file1}...")
     try:
@@ -329,7 +345,7 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
-    
+
     print(f"\nReading {args.input_file2}...")
     try:
         results2 = load_json_file(args.input_file2)
@@ -337,22 +353,22 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
-    
+
     # Print summary statistics
     compute_summary_stats(results1, args.input_file1)
     compute_summary_stats(results2, args.input_file2)
-    
+
     # Pair results
     pair_method = "index" if args.pair_by_index else "question"
     print(f"\nPairing results by {pair_method}...")
     pairs = pair_results(results1, results2, pair_by_question=not args.pair_by_index)
-    
+
     if len(pairs) == 0:
         print("Error: No pairs could be formed. Check that files have matching questions or indices.")
         return
-    
+
     print(f"Successfully paired {len(pairs)} results")
-    
+
     # Check which metrics are available
     available_metrics = []
     sample_result = pairs[0][0] if pairs else {}
@@ -370,19 +386,14 @@ def main():
             available_metrics.append('exact_match')
 
     if not available_metrics:
-        print("Warning: No recognized metric fields found. Looking for 'correct' (MATH), 'recall'/'recalled', 'exact_match', or 'em'")
+        print("Warning: No recognized metric fields found. Looking for 'correct' (MATH), "
+              "'recall'/'recalled', 'exact_match', or 'em'")
         return
-    
-    # Compute paired differences and bootstrap CIs for available metrics
+
+    # Run McNemar's test for each available metric
     for metric in available_metrics:
-        differences = compute_paired_differences(pairs, metric)
-        mean_diff, lower_bound, upper_bound = bootstrap_resample(
-            differences, 
-            n_bootstrap=args.n_bootstrap,
-            confidence_level=args.confidence_level
-        )
-        print_results(metric, mean_diff, lower_bound, upper_bound, 
-                     len(pairs), args.confidence_level)
+        result = mcnemar_test(pairs, metric)
+        print_results(metric, result, alpha=args.alpha)
 
 
 if __name__ == "__main__":
