@@ -40,7 +40,7 @@ export TINKER_API_KEY="your-tinker-key"
 | `run_eval_math.py` | Evaluate on MATH |
 | `Ex-Recall.py` | Refine model answer using GPT-5-mini |
 | `extract_thinking_tokens.py` | Extract and analyze thinking token counts from evaluation results |
-| `bootstrap_ci.py` | Bootstrap confidence intervals on two results trace files |
+| `sigtest.py` | McNemar’s test for statistical significance between two result trace files |
 | `reasoningsft_train.py` | SFT / Reasoning-SFT training on GPT-OSS-20B |
 | `/rl` | RL training on GPT-OSS-20B |
 
