@@ -1,6 +1,6 @@
 # Parametric Knowledge Access
 
-This repository contains scripts and results for the paper [Paper Title](link-to-paper).
+This repository contains scripts and results for the paper [Improving Parametric Knowledge Access in Reasoning Language Models](https://arxiv.org/abs/2602.22193).
 
 ## Overview
 
