@@ -3,16 +3,13 @@ import re
 import os
 import json
 import argparse
-import tempfile
 from pathlib import Path
 from tqdm import tqdm
-from openai import OpenAI
 import tinker
 from tinker.types import SamplingParams as TinkerSamplingParams
 from tinker_cookbook import renderers, tokenizer_utils
-from tinker_cookbook.renderers import GptOssRenderer, Message, Role
-from vllm import LLM, SamplingParams as vllmSamplingParams
-from transformers import AutoTokenizer
+from tinker_cookbook.renderers import Message, Role
+from tinker_cookbook.renderers.gpt_oss import GptOssRenderer
 from datasets import load_dataset as hf_load_dataset
 
 # MATH dataset categories
@@ -164,8 +161,11 @@ def strip_string(string):
     # linebreaks
     string = string.replace("\n", "")
 
-    # remove inverse spaces
+    # remove inverse spaces and LaTeX spacing commands
     string = string.replace("\\!", "")
+    string = string.replace("\\,", "")
+    string = string.replace("\\;", "")
+    string = string.replace("\\:", "")
 
     # replace \\ with \
     string = string.replace("\\\\", "\\")
@@ -225,34 +225,6 @@ def strip_string(string):
     return string
 
 
-class GPT52Evaluator:
-    def __init__(self):
-        self.client = OpenAI()
-        self.model_name = "gpt-5.2"
-
-    def build_prompt(self, question, use_cues):
-        instruction = "You will be given a question."
-        if use_cues:
-            instruction += " Think step-by-step and give your final answer in \\boxed{}."
-        else:
-            instruction += " Give your final answer in \\boxed{}."
-
-        return [
-            {"role": "user", "content": instruction + " " + question}
-        ]
-
-    def generate(self, question, use_cues, use_thinking):
-        messages = self.build_prompt(question, use_cues)
-        response = self.client.responses.create(
-            model=self.model_name,
-            reasoning={"effort": "medium"},
-            input=messages
-        )
-        text = response.output_text
-        token_count = response.usage.total_tokens
-        return text, token_count
-
-
 class GPTOSSEvaluator:
     def __init__(self, temperature, top_p, checkpoint_uri=None, inference_name=None):
         """
@@ -278,230 +250,212 @@ class GPTOSSEvaluator:
         self.SamplingParams = TinkerSamplingParams
         self.renderers = renderers
 
-    def build_prompt(self, question, use_cues):
-        system_content = "You will be given a question."
-        if use_cues:
-            system_content += " Think step-by-step and give your final answer in \\boxed{}."
-        else:
-            system_content += " Give your final answer in \\boxed{}."
-
+    def build_prompt(self, question):
+        system_content = "You will be given a question. Give your final answer in \\boxed{}."
         return [
             {'role': 'system', 'content': system_content},
             {'role': 'user', 'content': question}
         ]
 
-    def generate(self, question, use_cues, use_thinking):
-        messages = self.build_prompt(question, use_cues)
+    def generate(self, question, use_thinking):
+        messages = self.build_prompt(question)
 
+        # GptOssRenderer's default generation suffix is just "<|start|>assistant" —
+        # it does NOT auto-open a thinking channel (that's the model's own choice).
+        # So no-thinking mode is achieved via prefill, not a custom renderer
+        # subclass: same pattern as eval-recall.py / trivia_env.py.
+        prefill = None
         if use_thinking:
             renderer = self.renderers.get_renderer('gpt_oss_low_reasoning', self.tokenizer)
         else:
-            # Custom renderer that disables thinking
-            MessageClass = Message
-            tinker_module = tinker
-            tokenizer = self.tokenizer
-
-            class CustomGptOssRenderer(self.GptOssRenderer):
-                def build_generation_prompt(
-                    self, messages: list[Message], role: Role = "assistant", prefill: str | None = None
-                ) -> tinker.ModelInput:
-                    tokens: list[int] = []
-                    tokens.extend(self._bos_tokens)
-                    if self.use_system_prompt:
-                        tokens.extend(
-                            self.tokenizer.encode(self._build_system_prompt(), add_special_tokens=False)
-                        )
-                    for message in messages:
-                        ob_part, action_part, action_tail = self._render_message(message)
-                        tokens.extend(ob_part)
-                        tokens.extend(action_part)
-                    new_partial_message = MessageClass(role=role, content="")
-                    ob_part, _action_part, _action_tail = self._render_message(new_partial_message)
-                    tokens.extend(ob_part)
-                    tokens.extend(self.tokenizer.encode("<|channel|>analysis<|message|><|end|><|start|>assistant", add_special_tokens=False))
-                    tokens.extend(self.tokenizer.encode(prefill or "", add_special_tokens=False))
-                    return tinker_module.ModelInput.from_ints(tokens)
-
-            renderer = CustomGptOssRenderer(tokenizer, use_system_prompt=True, reasoning_effort="low")
+            renderer = self.GptOssRenderer(self.tokenizer, use_system_prompt=True, reasoning_effort="low")
+            prefill = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
 
         stop_sequences = renderer.get_stop_sequences()
-        sampling_params = self.SamplingParams(max_tokens=4096, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences)
+        prompt = renderer.build_generation_prompt(messages, prefill=prefill)
+        prompt_len = prompt.length if hasattr(prompt, 'length') else len(prompt)
+        max_tokens = min(32000, 32768 - prompt_len)
+        sampling_params = self.SamplingParams(max_tokens=max_tokens, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences)
+        output = self.sampling_client.sample(prompt, sampling_params=sampling_params, num_samples=1).result()
+        seq = output.sequences[0]
+
+        # Full raw output including analysis + final channels, same as eval-recall.py's GPTOSSEvaluator —
+        # decoding the raw token sequence directly instead of going through parse_response's
+        # structured ContentPart split, which silently drops thinking content when flattened.
+        text = self.tokenizer.decode(seq.tokens)
+
+        # Extract thinking tokens: content between <|channel|>analysis<|message|> and <|end|>
+        thinking_start = text.find("<|channel|>analysis<|message|>")
+        thinking_end = text.find("<|end|>", thinking_start) if thinking_start != -1 else -1
+
+        if thinking_start == -1:
+            # Model chose not to open a thinking channel at all — the response
+            # is already complete; there's nothing to force-close.
+            return text, len(seq.tokens), 0
+
+        if thinking_end != -1:
+            thinking_text = text[thinking_start + len("<|channel|>analysis<|message|>"):thinking_end]
+            thinking_token_count = len(self.tokenizer.encode(thinking_text, add_special_tokens=False))
+            return text, len(seq.tokens), thinking_token_count
+
+        # Thinking was opened but never closed — genuinely truncated mid-thinking.
+        # Force-close it and let the model continue straight to its boxed answer.
+        thinking_token_count = len(seq.tokens)
+        force_suffix = "<|end|><|start|>assistant<|channel|>final<|message|>"
+        force_suffix_tokens = self.tokenizer.encode(force_suffix, add_special_tokens=False)
+        forced_prompt = tinker.ModelInput.from_ints(
+            list(prompt.to_ints()) + list(seq.tokens) + force_suffix_tokens
+        )
+        forced_params = self.SamplingParams(
+            max_tokens=2048, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences
+        )
+        forced_output = self.sampling_client.sample(forced_prompt, sampling_params=forced_params, num_samples=1).result()
+        forced_text = self.tokenizer.decode(forced_output.sequences[0].tokens)
+        total_token_count = len(seq.tokens) + len(forced_output.sequences[0].tokens)
+        return text + force_suffix + forced_text, total_token_count, thinking_token_count
+
+
+class Qwen3Evaluator:
+    def __init__(self, temperature, top_p, checkpoint_uri=None, inference_name=None):
+        self.tokenizer = tokenizer_utils.get_tokenizer('Qwen/Qwen3-8B')
+        self.service_client = tinker.ServiceClient()
+
+        if checkpoint_uri and inference_name:
+            training_client = self.service_client.create_training_client_from_state(checkpoint_uri)
+            self.sampling_client = training_client.save_weights_and_get_sampling_client(inference_name)
+        else:
+            self.sampling_client = self.service_client.create_sampling_client(base_model='Qwen/Qwen3-8B')
+
+        self.temperature = temperature
+        self.top_p = top_p
+        self.SamplingParams = TinkerSamplingParams
+
+    def build_prompt(self, question):
+        system_content = "You will be given a question. Give your final answer in \\boxed{}."
+        return [
+            {'role': 'system', 'content': system_content},
+            {'role': 'user', 'content': question}
+        ]
+
+    def generate(self, question, use_thinking):
+        messages = self.build_prompt(question)
+
+        renderer_name = 'qwen3' if use_thinking else 'qwen3_disable_thinking'
+        renderer = renderers.get_renderer(renderer_name, self.tokenizer)
+
+        stop_sequences = renderer.get_stop_sequences()
+        sampling_params = self.SamplingParams(max_tokens=8092, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences)
 
         prompt = renderer.build_generation_prompt(messages)
         output = self.sampling_client.sample(prompt, sampling_params=sampling_params, num_samples=1).result()
-        sampled_message, _ = renderer.parse_response(output.sequences[0].tokens)
-
-        text = sampled_message["content"]
-        token_count = len(output.sequences[0].tokens)
-        return text, token_count
-
-
-class OlmoEvaluator:
-    def __init__(self, temperature, top_p, batch_size=16):
-        self.model_name = "allenai/Olmo-3-7B-Think"
-        self.temperature = temperature
-        self.top_p = top_p
-        self.batch_size = batch_size
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.temp_dir = tempfile.mkdtemp()
-        self.custom_tokenizer_path = None
-        self.SamplingParams = vllmSamplingParams
-        self.llm = None
-
-    def build_prompt(self, question, use_cues, use_thinking):
-        system_content = "You will be given a question."
-        if use_cues:
-            system_content += " Think step-by-step and give your final answer in \\boxed{}."
-        else:
-            system_content += " Give your final answer in \\boxed{}."
-
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": question}
-        ]
+        seq = output.sequences[0]
+        raw_full = self.tokenizer.decode(seq.tokens)
 
         if not use_thinking:
-            # Prefill with closed think tags for no-thinking mode
-            if self.custom_tokenizer_path is None:
-                self.tokenizer.chat_template = """<｜begin▁of▁sentence｜>{% for message in messages %}<｜{{ message.role | capitalize }}｜>{{ message.content }}{% endfor %}<｜Assistant｜><think>\n\n</think>\n"""
-                self.custom_tokenizer_path = f"{self.temp_dir}/custom_olmo_tokenizer"
-                self.tokenizer.save_pretrained(self.custom_tokenizer_path)
+            # The <think> opening tag is part of the prompt (generation prefix) for
+            # the disable-thinking renderer, never part of the sampled completion —
+            # so there's nothing to detect or retry here.
+            return raw_full, len(seq.tokens), 0
 
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        # Unlike the disable-thinking renderer, <think> is NOT prefilled in thinking
+        # mode (verified: the 'qwen3' renderer's prompt just ends at the assistant
+        # turn marker) — the model decides whether to open it at all. So a missing
+        # </think> is only a truncation if <think> was actually opened.
+        think_start = raw_full.find("<think>")
+        think_end = raw_full.find("</think>", think_start) if think_start != -1 else -1
+
+        if think_start == -1:
+            # Model chose not to open thinking at all — nothing to force-close.
+            return raw_full, len(seq.tokens), 0
+
+        if think_end != -1:
+            thinking_text = raw_full[think_start + len("<think>"):think_end]
+            thinking_token_count = len(self.tokenizer.encode(thinking_text, add_special_tokens=False))
+            return raw_full, len(seq.tokens), thinking_token_count
+
+        # Thinking was opened but never closed — genuinely truncated mid-thinking.
+        # Force-close it and let the model continue straight to its \boxed{} answer.
+        thinking_token_count = len(seq.tokens)
+        force_suffix = "\n</think>\n"
+        force_suffix_tokens = self.tokenizer.encode(force_suffix, add_special_tokens=False)
+        forced_prompt = tinker.ModelInput.from_ints(
+            list(prompt.to_ints()) + list(seq.tokens) + force_suffix_tokens
         )
+        forced_params = self.SamplingParams(
+            max_tokens=2048, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences
+        )
+        forced_output = self.sampling_client.sample(forced_prompt, sampling_params=forced_params, num_samples=1).result()
+        forced_text = self.tokenizer.decode(forced_output.sequences[0].tokens)
+        total_token_count = len(seq.tokens) + len(forced_output.sequences[0].tokens)
+        return raw_full + force_suffix + forced_text, total_token_count, thinking_token_count
 
-    def initialize_llm(self, use_thinking):
-        if self.llm is None:
-            if not use_thinking and self.custom_tokenizer_path:
-                self.llm = LLM(
-                    model=self.model_name,
-                    tokenizer=self.custom_tokenizer_path,
-                    dtype="bfloat16",
-                    gpu_memory_utilization=0.5,
-                )
-            else:
-                self.llm = LLM(
-                    model=self.model_name,
-                    dtype="bfloat16",
-                    gpu_memory_utilization=0.5,
-                )
 
-    def generate_batch(self, questions, use_cues, use_thinking):
-        prompts = [self.build_prompt(q, use_cues, use_thinking) for q in questions]
-        self.initialize_llm(use_thinking)
+class Nemotron3Evaluator:
+    def __init__(self, temperature, top_p, checkpoint_uri=None, inference_name=None):
+        self.model_name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+        self.tokenizer = tokenizer_utils.get_tokenizer(self.model_name)
+        self.service_client = tinker.ServiceClient()
 
-        if use_thinking:
-            thinking_params = self.SamplingParams(
-                max_tokens=7000,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                n=1,
-            )
-            outputs = self.llm.generate(prompts, thinking_params)
-
-            results = []
-            for i, out in enumerate(outputs):
-                text = out.outputs[0].text
-                thinking_tokens = len(out.outputs[0].token_ids)
-
-                if "</think>" in text.lower():
-                    final_text = text
-                    token_count = thinking_tokens
-                else:
-                    forced_prompt = prompts[i] + text + "\n</think>\n"
-                    answer_params = self.SamplingParams(
-                        max_tokens=1028,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        n=1,
-                    )
-                    answer_out = self.llm.generate([forced_prompt], answer_params)[0]
-                    final_text = text + "\n</think>\n" + answer_out.outputs[0].text
-                    token_count = thinking_tokens + len(answer_out.outputs[0].token_ids)
-
-                results.append((final_text, token_count))
-            return results
+        if checkpoint_uri and inference_name:
+            training_client = self.service_client.create_training_client_from_state(checkpoint_uri)
+            self.sampling_client = training_client.save_weights_and_get_sampling_client(inference_name)
         else:
-            sampling_params = self.SamplingParams(
-                max_tokens=4096,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                n=1,
-            )
-            outputs = self.llm.generate(prompts, sampling_params)
-            return [(out.outputs[0].text, len(out.outputs[0].token_ids)) for out in outputs]
+            self.sampling_client = self.service_client.create_sampling_client(base_model=self.model_name)
 
-
-class R1QwenEvaluator:
-    def __init__(self, temperature, top_p, batch_size=16):
-        self.model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
         self.temperature = temperature
         self.top_p = top_p
-        self.batch_size = batch_size
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.temp_dir = tempfile.mkdtemp()
-        self.custom_tokenizer_path = None
-        self.SamplingParams = vllmSamplingParams
-        self.llm = None
+        self.SamplingParams = TinkerSamplingParams
 
-    def build_prompt(self, question, use_cues, use_thinking):
-        if use_cues:
-            system_prompt = "Think step-by-step and give your final answer in \\boxed{}."
-        else:
-            system_prompt = "Give your final answer in \\boxed{}."
-
-        messages = [
-            {"role": "user", "content": question + "\n" + system_prompt}
+    def build_prompt(self, question):
+        system_content = "You will be given a question. Give your final answer in \\boxed{}."
+        return [
+            {'role': 'system', 'content': system_content},
+            {'role': 'user', 'content': question}
         ]
 
+    def generate(self, question, use_thinking):
+        messages = self.build_prompt(question)
+
+        # Nemotron3Renderer(Qwen3_5Renderer): <think>\n...\n</think>\n formatting.
+        # Disable variant prepends <think></think> to skip thinking.
+        renderer_name = 'nemotron3' if use_thinking else 'nemotron3_disable_thinking'
+        renderer = renderers.get_renderer(renderer_name, self.tokenizer)
+
+        stop_sequences = renderer.get_stop_sequences()
+        sampling_params = self.SamplingParams(max_tokens=8092, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences)
+
+        prompt = renderer.build_generation_prompt(messages)
+        output = self.sampling_client.sample(prompt, sampling_params=sampling_params, num_samples=1).result()
+        seq = output.sequences[0]
+        raw_full = self.tokenizer.decode(seq.tokens)
+
         if not use_thinking:
-            # Prefill with closed think tags for no-thinking mode
-            if self.custom_tokenizer_path is None:
-                self.tokenizer.chat_template = """{% for message in messages %}{{ message.content }}{% endfor %}<think>\n\n</think>\n"""
-                self.custom_tokenizer_path = f"{self.temp_dir}/custom_r1_tokenizer"
-                self.tokenizer.save_pretrained(self.custom_tokenizer_path)
+            return raw_full, len(seq.tokens), 0
 
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        think_end = raw_full.find("</think>")
+        if think_end != -1:
+            thinking_text = raw_full[:think_end]
+            thinking_token_count = len(self.tokenizer.encode(thinking_text, add_special_tokens=False))
+            return raw_full, len(seq.tokens), thinking_token_count
+
+        # Max tokens hit mid-thinking — force close thinking and let the model
+        # continue straight to its \boxed{} answer.
+        thinking_token_count = len(seq.tokens)
+        force_suffix = "\n</think>\n"
+        force_suffix_tokens = self.tokenizer.encode(force_suffix, add_special_tokens=False)
+        forced_prompt = tinker.ModelInput.from_ints(
+            list(prompt.to_ints()) + list(seq.tokens) + force_suffix_tokens
         )
-
-    def initialize_llm(self, use_thinking):
-        if self.llm is None:
-            if not use_thinking and self.custom_tokenizer_path:
-                self.llm = LLM(
-                    model=self.model_name,
-                    tokenizer=self.custom_tokenizer_path,
-                    dtype="bfloat16",
-                    gpu_memory_utilization=0.3,
-                )
-            else:
-                self.llm = LLM(
-                    model=self.model_name,
-                    dtype="bfloat16",
-                    gpu_memory_utilization=0.3,
-                )
-
-    def generate_batch(self, questions, use_cues, use_thinking):
-        prompts = [self.build_prompt(q, use_cues, use_thinking) for q in questions]
-        self.initialize_llm(use_thinking)
-
-        sampling_params = self.SamplingParams(
-            max_tokens=4096,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            n=1,
+        forced_params = self.SamplingParams(
+            max_tokens=2048, temperature=self.temperature, top_p=self.top_p, stop=stop_sequences
         )
+        forced_output = self.sampling_client.sample(forced_prompt, sampling_params=forced_params, num_samples=1).result()
+        forced_text = self.tokenizer.decode(forced_output.sequences[0].tokens)
+        total_token_count = len(seq.tokens) + len(forced_output.sequences[0].tokens)
+        return raw_full + force_suffix + forced_text, total_token_count, thinking_token_count
 
-        outputs = self.llm.generate(prompts, sampling_params)
-        return [(out.outputs[0].text, len(out.outputs[0].token_ids)) for out in outputs]
 
-
-def prepare_dataset_from_hf(split="test"):
+def prepare_MATH_from_hf(split="test"):
     """Prepare MATH dataset from HuggingFace"""
     print(f"Loading MATH dataset from HuggingFace (split: {split})...")
 
@@ -521,242 +475,250 @@ def prepare_dataset_from_hf(split="test"):
     print(f"\nTotal dataset size: {len(all_problems)}")
     return all_problems
 
+def prepare_AIME_from_hf():
+    """Prepare AIME dataset from all three HuggingFace sources"""
+    all_problems = []
 
-def run_evaluation(model_name, sample, use_cues, use_thinking, temperature, top_p, output_dir, checkpoint_uri=None, inference_name=None):
+    # AIME 1983-2024
+    print("Loading AIME 1983-2024...")
+    ds = hf_load_dataset("di-zhang-fdu/AIME_1983_2024", split="train")
+    for item in ds:
+        all_problems.append({
+            "problem": item["Question"],
+            "solution": item["Answer"],
+            "type": item["Year"],
+        })
+    print(f"    {len(ds)} problems")
+
+    # AIME 2025
+    print("Loading AIME 2025...")
+    ds = hf_load_dataset("math-ai/aime25", split="test")
+    for item in ds:
+        all_problems.append({
+            "problem": item["problem"],
+            "solution": str(item["answer"]),
+            "type": "2025",
+        })
+    print(f"    {len(ds)} problems")
+
+    # AIME 2026
+    print("Loading AIME 2026...")
+    ds = hf_load_dataset("MathArena/aime_2026", split="train")
+    for item in ds:
+        all_problems.append({
+            "problem": item["problem"],
+            "solution": str(item["answer"]),
+            "type": "2026",
+        })
+    print(f"    {len(ds)} problems")
+
+    print(f"\nTotal dataset size: {len(all_problems)}")
+    return all_problems
+
+def prepare_AIME25_from_hf():
+    """Prepare AIME 2025 dataset from HuggingFace"""
+    print("Loading AIME 2025...")
+    all_problems = []
+    ds = hf_load_dataset("math-ai/aime25", split="test")
+    for item in ds:
+        all_problems.append({
+            "problem": item["problem"],
+            "solution": str(item["answer"]),
+            "type": "2025",
+        })
+    print(f"    {len(ds)} problems")
+    print(f"\nTotal dataset size: {len(all_problems)}")
+    return all_problems
+
+def prepare_AIME26_from_hf():
+    """Prepare AIME 2026 dataset from HuggingFace"""
+    print("Loading AIME 2026...")
+    all_problems = []
+    ds = hf_load_dataset("MathArena/aime_2026", split="train")
+    for item in ds:
+        all_problems.append({
+            "problem": item["problem"],
+            "solution": str(item["answer"]),
+            "type": "2026",
+        })
+    print(f"    {len(ds)} problems")
+    print(f"\nTotal dataset size: {len(all_problems)}")
+    return all_problems
+
+def run_evaluation(model_name, dataset, sample, use_thinking, temperature, top_p, output_dir, checkpoint_uri=None, inference_name=None):
     # Build output filename
-    cues_str = "with_cues" if use_cues else "no_cues"
     thinking_str = "with_thinking" if use_thinking else "no_thinking"
 
     model_short = {
-        "gpt-5.2": "gpt52",
         "gpt-oss-20b": "gptoss20b",
-        "olmo-3-7b-think": "olmo3",
-        "r1-distill-qwen-1.5b": "r1qwen"
+        "qwen3-8b": "qwen38b",
+        "nemotron3": "nemotron3",
     }[model_name]
 
     # Add inference_name to model_short if checkpoint is being used
     if inference_name:
         model_short = f"{model_short}_{inference_name}"
 
-    # GPT-5.2 doesn't have thinking control
-    if model_name == "gpt-5.2" and not use_thinking:
-        print(f"Warning: GPT-5.2 doesn't support no-thinking mode. Skipping.")
-        return
+    dataset_lower = dataset.lower()
+    output_file = Path(output_dir) / f"{dataset_lower}_{model_short}_{thinking_str}.json"
 
-    if model_name == "gpt-5.2":
-        output_file = Path(output_dir) / f"math_{model_short}_{cues_str}.json"
-    else:
-        output_file = Path(output_dir) / f"math_{model_short}_{cues_str}_{thinking_str}.json"
-
-    print(f"\nRunning evaluation: {model_name} on MATH")
+    print(f"\nRunning evaluation: {model_name} on {dataset}")
     print(f"  Dataset size: {len(sample)} problems")
-    print(f"  Cues: {use_cues}, Thinking: {use_thinking}")
-    if model_name == "gpt-5.2":
-        print(f"  Temperature and Top-p settings not applicable to GPT-5.2")
-    else:
-        print(f"  Temperature: {temperature}, Top-p: {top_p}")
+    print(f"  Thinking: {use_thinking}")
+    print(f"  Temperature: {temperature}, Top-p: {top_p}")
     print(f"  Output: {output_file}")
 
     # Initialize evaluator
-    if model_name == "gpt-5.2":
-        evaluator = GPT52Evaluator()
-        batch_mode = False
-    elif model_name == "gpt-oss-20b":
+    if model_name == "gpt-oss-20b":
         evaluator = GPTOSSEvaluator(temperature, top_p, checkpoint_uri, inference_name)
-        batch_mode = False
-    elif model_name == "olmo-3-7b-think":
-        evaluator = OlmoEvaluator(temperature, top_p)
-        batch_mode = True
-    elif model_name == "r1-distill-qwen-1.5b":
-        evaluator = R1QwenEvaluator(temperature, top_p)
-        batch_mode = True
+    elif model_name == "qwen3-8b":
+        evaluator = Qwen3Evaluator(temperature, top_p, checkpoint_uri, inference_name)
+    elif model_name == "nemotron3":
+        evaluator = Nemotron3Evaluator(temperature, top_p, checkpoint_uri, inference_name)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    # Run evaluation
+    # Resume from existing file if present
     results = []
     errors = []
     token_lengths = []
     correct_token_lengths = []
     incorrect_token_lengths = []
+    thinking_token_lengths = []
     success = 0
 
-    if batch_mode:
-        batch_size = evaluator.batch_size
-        for i in tqdm(range(0, len(sample), batch_size)):
-            batch_items = sample[i:i + batch_size]
-            batch_questions = [item["problem"] for item in batch_items]
+    if output_file.exists():
+        with open(output_file) as f:
+            existing = json.load(f)
+        results = existing.get("results", [])
+        errors = existing.get("errors", [])
+        for r in results:
+            tc = r.get("num_tokens", 0)
+            token_lengths.append(tc)
+            thinking_token_lengths.append(r.get("num_thinking_tokens", 0))
+            if r["correct"]:
+                success += 1
+                correct_token_lengths.append(tc)
+            else:
+                incorrect_token_lengths.append(tc)
+        print(f"  Resuming from {len(results)} completed problems, {len(errors)} errors.")
+
+    total_problems = len(sample)
+
+    from collections import defaultdict
+    completed_counts = defaultdict(int)
+    for r in results:
+        completed_counts[r["problem"]] += 1
+    occurrence = defaultdict(int)
+    remaining = []
+    for item in sample:
+        p = item["problem"]
+        if occurrence[p] < completed_counts[p]:
+            occurrence[p] += 1
+        else:
+            remaining.append(item)
+    sample = remaining
+    print(f"  Remaining: {len(sample)} problems.")
+
+    for idx, item in tqdm(enumerate(sample), total=len(sample)):
+        try:
+            text, token_count, thinking_token_count = evaluator.generate(item["problem"], use_thinking)
 
             try:
-                batch_results = evaluator.generate_batch(batch_questions, use_cues, use_thinking)
-
-                for item, (text, token_count) in zip(batch_items, batch_results):
-                    try:
-                        # Extract prediction
-                        pred_boxed = last_boxed_only_string(text)
-                        pred = remove_boxed(pred_boxed) if pred_boxed else None
-                    except Exception as e:
-                        pred = None
-                        errors.append({
-                            "problem": item["problem"],
-                            "error": f"pred_extraction: {str(e)}"
-                        })
-
-                    try:
-                        # Extract ground truth
-                        gt_boxed = last_boxed_only_string(item["solution"])
-                        gt = remove_boxed(gt_boxed) if gt_boxed else None
-                    except Exception as e:
-                        gt = None
-                        errors.append({
-                            "problem": item["problem"],
-                            "error": f"gt_extraction: {str(e)}"
-                        })
-
-                    correct = is_equiv(pred, gt)
-
-                    token_lengths.append(token_count)
-                    if correct:
-                        correct_token_lengths.append(token_count)
-                        success += 1
-                    else:
-                        incorrect_token_lengths.append(token_count)
-
-                    results.append({
-                        "problem": item["problem"],
-                        "solution": item["solution"],
-                        "type": item["type"],
-                        "raw_prediction": text,
-                        "extracted_prediction": pred,
-                        "extracted_gt": gt,
-                        "num_tokens": token_count,
-                        "correct": correct,
-                    })
-
+                # Extract prediction
+                pred_boxed = last_boxed_only_string(text)
+                pred = remove_boxed(pred_boxed) if pred_boxed else None
             except Exception as e:
-                for item in batch_items:
-                    errors.append({
-                        "problem": item["problem"],
-                        "error": str(e),
-                    })
-
-            # Save after each batch
-            aggregate_metrics = {
-                "total_problems": len(sample),
-                "correct": success,
-                "accuracy": success / len(sample),
-                "extraction_errors": len(errors),
-                "avg_tokens": sum(token_lengths) / len(token_lengths) if token_lengths else 0,
-                "avg_tokens_correct": sum(correct_token_lengths) / len(correct_token_lengths) if correct_token_lengths else 0,
-                "avg_tokens_incorrect": sum(incorrect_token_lengths) / len(incorrect_token_lengths) if incorrect_token_lengths else 0,
-                "num_correct": len(correct_token_lengths),
-                "num_incorrect": len(incorrect_token_lengths),
-            }
-
-            with open(output_file, "w") as f:
-                json.dump(
-                    {
-                        "results": results,
-                        "aggregate_metrics": aggregate_metrics,
-                        "errors": errors,
-                    },
-                    f,
-                    indent=2,
-                )
-    else:
-        for idx, item in tqdm(enumerate(sample), total=len(sample)):
-            try:
-                text, token_count = evaluator.generate(item["problem"], use_cues, use_thinking)
-
-                try:
-                    # Extract prediction
-                    pred_boxed = last_boxed_only_string(text)
-                    pred = remove_boxed(pred_boxed) if pred_boxed else None
-                except Exception as e:
-                    pred = None
-                    errors.append({
-                        "problem": item["problem"],
-                        "error": f"pred_extraction: {str(e)}"
-                    })
-
-                try:
-                    # Extract ground truth
-                    gt_boxed = last_boxed_only_string(item["solution"])
-                    gt = remove_boxed(gt_boxed) if gt_boxed else None
-                except Exception as e:
-                    gt = None
-                    errors.append({
-                        "problem": item["problem"],
-                        "error": f"gt_extraction: {str(e)}"
-                    })
-
-                correct = is_equiv(pred, gt)
-
-                token_lengths.append(token_count)
-                if correct:
-                    correct_token_lengths.append(token_count)
-                    success += 1
-                else:
-                    incorrect_token_lengths.append(token_count)
-
-                results.append({
-                    "problem": item["problem"],
-                    "solution": item["solution"],
-                    "type": item["type"],
-                    "raw_prediction": text,
-                    "extracted_prediction": pred,
-                    "extracted_gt": gt,
-                    "num_tokens": token_count,
-                    "correct": correct,
-                })
-
-            except Exception as e:
+                pred = None
                 errors.append({
                     "problem": item["problem"],
-                    "error": str(e),
+                    "error": f"pred_extraction: {str(e)}"
                 })
 
-            # Save after each question
-            aggregate_metrics = {
-                "total_problems": len(sample),
-                "correct": success,
-                "accuracy": success / len(sample),
-                "extraction_errors": len(errors),
-                "avg_tokens": sum(token_lengths) / len(token_lengths) if token_lengths else 0,
-                "avg_tokens_correct": sum(correct_token_lengths) / len(correct_token_lengths) if correct_token_lengths else 0,
-                "avg_tokens_incorrect": sum(incorrect_token_lengths) / len(incorrect_token_lengths) if incorrect_token_lengths else 0,
-                "num_correct": len(correct_token_lengths),
-                "num_incorrect": len(incorrect_token_lengths),
-            }
+            try:
+                # Extract ground truth
+                gt_boxed = last_boxed_only_string(item["solution"])
+                if gt_boxed:
+                    gt = remove_boxed(gt_boxed)
+                else:
+                    gt = item["solution"].strip()
+            except Exception as e:
+                gt = item["solution"].strip()
+                errors.append({
+                    "problem": item["problem"],
+                    "error": f"gt_extraction: {str(e)}"
+                })
 
-            with open(output_file, "w") as f:
-                json.dump(
-                    {
-                        "results": results,
-                        "aggregate_metrics": aggregate_metrics,
-                        "errors": errors,
-                    },
-                    f,
-                    indent=2,
-                )
+            correct = is_equiv(pred, gt)
+
+            token_lengths.append(token_count)
+            thinking_token_lengths.append(thinking_token_count)
+            if correct:
+                correct_token_lengths.append(token_count)
+                success += 1
+            else:
+                incorrect_token_lengths.append(token_count)
+
+            results.append({
+                "problem": item["problem"],
+                "solution": item["solution"],
+                "type": item.get("type"),
+                "raw_prediction": text,
+                "extracted_prediction": pred,
+                "extracted_gt": gt,
+                "num_tokens": token_count,
+                "num_thinking_tokens": thinking_token_count,
+                "correct": correct,
+            })
+
+        except Exception as e:
+            errors.append({
+                "problem": item["problem"],
+                "error": str(e),
+            })
+
+        # Save after each question
+        aggregate_metrics = {
+            "total_problems": total_problems,
+            "correct": success,
+            "accuracy": success / total_problems,
+            "extraction_errors": len(errors),
+            "avg_tokens": sum(token_lengths) / len(token_lengths) if token_lengths else 0,
+            "avg_tokens_correct": sum(correct_token_lengths) / len(correct_token_lengths) if correct_token_lengths else 0,
+            "avg_tokens_incorrect": sum(incorrect_token_lengths) / len(incorrect_token_lengths) if incorrect_token_lengths else 0,
+            "avg_thinking_tokens": sum(thinking_token_lengths) / len(thinking_token_lengths) if thinking_token_lengths else 0,
+            "num_correct": len(correct_token_lengths),
+            "num_incorrect": len(incorrect_token_lengths),
+        }
+
+        with open(output_file, "w") as f:
+            json.dump(
+                {
+                    "results": results,
+                    "aggregate_metrics": aggregate_metrics,
+                    "errors": errors,
+                },
+                f,
+                indent=2,
+            )
 
     print(f"Finished all problems. Results saved to {output_file}")
-    print(f"Final Accuracy: {success}/{len(sample)} = {success/len(sample):.2%}")
+    print(f"Final Accuracy: {success}/{total_problems} = {success/total_problems:.2%}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run MATH evaluation on various models")
+    parser = argparse.ArgumentParser(description="Run MATH evaluation on various models and various datasets")
     parser.add_argument("--model", type=str, required=True,
-                        choices=["gpt-5.2", "gpt-oss-20b", "olmo-3-7b-think", "r1-distill-qwen-1.5b"],
+                        choices=["gpt-oss-20b", "qwen3-8b", "nemotron3"],
                         help="Model to evaluate")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["MATH", "AIME", "AIME25", "AIME26"],
+                        help="Dataset to evaluate")
 
     # Model options
-    parser.add_argument("--cues", type=str, default="no",
-                        choices=["yes", "no"],
-                        help="Use thinking cues (think step-by-step)")
     parser.add_argument("--thinking", type=str, default="yes",
                         choices=["yes", "no"],
-                        help="Enable thinking mode (not applicable for gpt-5.2)")
+                        help="Enable thinking mode")
     parser.add_argument("--temperature", type=float, default=0.6,
                         help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.95,
@@ -767,30 +729,45 @@ def main():
                         help="Tinker URI to load from checkpoint (for gpt-oss-20b only)")
     parser.add_argument("--inference_name", type=str, default=None,
                         help="Inference client name when loading from checkpoint (for gpt-oss-20b only)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit number of examples to evaluate")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Shuffle dataset with this seed before applying --limit")
 
     args = parser.parse_args()
 
-    # Convert string args to boolean
-    use_cues = args.cues == "yes"
     use_thinking = args.thinking == "yes"
 
     # Create output directory
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load dataset from HuggingFace (always use test split)
-    sample = prepare_dataset_from_hf(split="test")
+    # Load dataset
+    if args.dataset == "MATH":
+        sample = prepare_MATH_from_hf(split="test")
+    elif args.dataset == "AIME25":
+        sample = prepare_AIME25_from_hf()
+    elif args.dataset == "AIME26":
+        sample = prepare_AIME26_from_hf()
+    else:
+        sample = prepare_AIME_from_hf()
+
+    if args.seed is not None:
+        import random
+        random.Random(args.seed).shuffle(sample)
+    if args.limit is not None:
+        sample = sample[:args.limit]
 
     # Run evaluation
     run_evaluation(
         model_name=args.model,
+        dataset=args.dataset,
         sample=sample,
-        use_cues=use_cues,
         use_thinking=use_thinking,
         temperature=args.temperature,
         top_p=args.top_p,
         output_dir=args.output_dir,
         checkpoint_uri=args.checkpoint_uri,
-        inference_name=args.inference_name
+        inference_name=args.inference_name,
     )
 
 
