@@ -83,6 +83,17 @@ def recall_score(prediction, ground_truths):
     pred = normalize_answer(prediction)
     return any(normalize_answer(gt) in pred for gt in ground_truths)
 
+# ======================================================================
+# Extract Thinking Tokens
+# ======================================================================
+
+def extract_thinking(raw_prediction):
+    """Extract thinking content from <think>...</think> blocks."""
+    match = re.search(r"<think>(.*?)</think>", raw_prediction, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
 
 # ======================================================================
 # Grader Functions
@@ -103,7 +114,7 @@ def grade_answer(given_answer: str, ground_truths: list[str]) -> dict[str, bool]
 
     return {
         "EM": EM,
-        "Recall": Recall
+        "Recall": Recall,
     }
 
 

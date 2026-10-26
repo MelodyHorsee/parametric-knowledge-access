@@ -14,6 +14,7 @@ import logging
 import random
 import re
 import time
+from pathlib import Path
 
 import chz
 import datasets
@@ -23,7 +24,7 @@ from tinker_cookbook import checkpoint_utils, cli_utils, model_info, renderers
 from tinker_cookbook.supervised.common import compute_mean_nll
 from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.tokenizer_utils import get_tokenizer
-from tinker_cookbook.utils import ml_log
+from tinker_cookbook.utils import logtree, ml_log
 from tinker_cookbook.utils.format_colorized import format_colorized
 from trivia_grading import extract_answer, exact_match_score, recall_score
 
@@ -59,6 +60,12 @@ class Config:
 
     # Checkpointing
     save_every: int = 100
+
+    # Tracing: writes an HTML log of a few training examples per traced step,
+    # mirroring the per-iteration rollout traces RL training writes via logtree
+    # (see tinker_cookbook.rl.train's iteration_*/train.html).
+    trace_every: int = 100
+    num_examples_to_log: int = 4
 
     # Service configuration
     base_url: str | None = None
@@ -96,8 +103,10 @@ def build_messages(question: str, answer: str) -> list[dict]:
         {"role": "user", "content": question},
         {
             "role": "assistant",
-            "thinking": f"Need answer: {answer}.",
-            "content": formatted_answer,
+            "content": [
+                {"type": "thinking", "thinking": f"Need answer: {answer}."},
+                {"type": "text", "text": formatted_answer},
+            ],
         },
     ]
 
@@ -130,8 +139,10 @@ def build_messages_correct(question: str, raw_prediction: str) -> list[dict]:
         {"role": "user", "content": question},
         {
             "role": "assistant",
-            "thinking": thinking_trace,
-            "content": answer,
+            "content": [
+                {"type": "thinking", "thinking": thinking_trace},
+                {"type": "text", "text": answer},
+            ],
         },
     ]
 
@@ -209,13 +220,6 @@ def main(config: Config):
         dataset = datasets.load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
         dataset = dataset.shuffle(seed=config.seed)
 
-    if config.max_steps:
-        max_examples = config.max_steps * config.batch_size
-        if trajectories is not None:
-            dataset = dataset[:max_examples]
-        else:
-            dataset = dataset.select(range(min(max_examples, len(dataset))))
-
     # Load validation set
     val_datums = []
     val_questions = []
@@ -236,8 +240,26 @@ def main(config: Config):
                 logger.warning(f"Failed to create val datum: {e}")
         logger.info(f"Loaded {len(val_datums)} validation examples")
 
+    # Remove any training examples that overlap with the validation set, to
+    # prevent train/val contamination. This matters most for standard SFT,
+    # which by default loads the *full* TriviaQA train split — the same pool
+    # val_path may itself have been drawn from.
+    if val_questions:
+        val_question_set = {vq["question"] for vq in val_questions}
+        before = len(dataset)
+        if trajectories is not None:
+            dataset = [row for row in dataset if row["question"] not in val_question_set]
+        else:
+            dataset = dataset.filter(lambda row: row["question"] not in val_question_set)
+        logger.info(
+            f"Filtered {before - len(dataset)} training examples overlapping with "
+            f"validation set ({len(dataset)} remaining)"
+        )
+
     n_train_batches = len(dataset) // config.batch_size
     total_steps = n_train_batches * config.num_epochs
+    if config.max_steps is not None:
+        total_steps = min(total_steps, config.max_steps)
     logger.info(f"Train batches per epoch: {n_train_batches}, total steps: {total_steps}")
 
     # Setup training client
@@ -245,10 +267,10 @@ def main(config: Config):
     resume_info = checkpoint_utils.get_last_checkpoint(log_path)
     if resume_info:
         training_client = service_client.create_training_client_from_state_with_optimizer(
-            resume_info["state_path"]
+            resume_info.state_path
         )
-        start_epoch = resume_info.get("epoch", 0)
-        start_batch = resume_info.get("batch", 0)
+        start_epoch = resume_info.epoch or 0
+        start_batch = resume_info.batch or 0
         global_step = start_epoch * n_train_batches + start_batch
         logger.info(f"Resuming from epoch {start_epoch}, batch {start_batch} (global step {global_step})")
     else:
@@ -261,6 +283,8 @@ def main(config: Config):
 
     # Training loop
     for epoch in range(start_epoch, config.num_epochs):
+        if config.max_steps is not None and epoch * n_train_batches >= config.max_steps:
+            break
         logger.info(f"Starting epoch {epoch + 1}/{config.num_epochs}")
 
         if trajectories is not None:
@@ -273,8 +297,11 @@ def main(config: Config):
         epoch_start_batch = start_batch if epoch == start_epoch else 0
 
         for batch_idx in range(epoch_start_batch, n_train_batches):
-            start_time = time.time()
             global_step = epoch * n_train_batches + batch_idx
+            if config.max_steps is not None and global_step >= config.max_steps:
+                break
+
+            start_time = time.time()
             metrics = {}
 
             # Save checkpoint
@@ -302,6 +329,7 @@ def main(config: Config):
                 batch_rows = epoch_dataset.select(range(batch_start_idx, batch_end_idx))
 
             batch = []
+            batch_messages = []
             for row in batch_rows:
                 try:
                     if trajectories is not None:
@@ -317,6 +345,7 @@ def main(config: Config):
                         messages, renderer, config.max_length, config.train_on_what,
                     )
                     batch.append(datum)
+                    batch_messages.append(messages)
                 except Exception as e:
                     logger.warning(f"Failed to create datum: {e}")
                     continue
@@ -370,6 +399,29 @@ def main(config: Config):
             )
             ml_logger.log_metrics(metrics=metrics, step=global_step)
 
+            # Write an HTML trace of a few training examples, mirroring RL training's
+            # per-iteration rollout traces (tinker_cookbook.rl.train's logtree usage,
+            # written to iteration_XXXXXX/train.html).
+            if config.trace_every > 0 and global_step % config.trace_every == 0:
+                iter_dir = Path(log_path) / f"iteration_{global_step:06d}"
+                iter_dir.mkdir(parents=True, exist_ok=True)
+                with logtree.init_trace(
+                    f"SFT step {global_step}", path=str(iter_dir / "train.html")
+                ):
+                    logtree.log_text(
+                        f"Epoch {epoch + 1}, step {global_step}, NLL: {train_nll:.4f}, "
+                        f"LR: {current_lr:.2e}"
+                    )
+                    for messages in batch_messages[: config.num_examples_to_log]:
+                        question = messages[1]["content"]
+                        parts = messages[-1]["content"]
+                        thinking = "".join(p["thinking"] for p in parts if p["type"] == "thinking")
+                        answer = "".join(p["text"] for p in parts if p["type"] == "text")
+                        with logtree.scope_header(f"Question: {question[:80]}"):
+                            logtree.log_text(f"Question: {question}")
+                            logtree.log_text(f"Thinking: {thinking}")
+                            logtree.log_text(f"Answer: {answer}")
+
             # Validation NLL evaluation
             if val_datums and config.eval_every > 0 and global_step % config.eval_every == 0 and global_step > 0:
                 logger.info(f"Step {global_step}: running validation ({len(val_datums)} examples)...")
@@ -414,7 +466,10 @@ def main(config: Config):
                     try:
                         output = future.result()
                         sampled_message, _ = renderer.parse_response(output.sequences[0].tokens)
-                        extracted = extract_answer(sampled_message["content"])
+                        content = sampled_message["content"]
+                        if isinstance(content, list):
+                            content = " ".join(c if isinstance(c, str) else c.get("text", "") for c in content)
+                        extracted = extract_answer(content)
                         em = exact_match_score(extracted, vq["ground_truth"])
                         rec = recall_score(extracted, vq["ground_truth"])
                         if em:

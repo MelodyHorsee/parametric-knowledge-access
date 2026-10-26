@@ -5,10 +5,8 @@ from typing import Literal
 
 import chz
 from tinker_cookbook import cli_utils, model_info
-from tinker_cookbook.recipes.trivia_rl import (
-    trivia_env,
-)
-from tinker_cookbook.rl.train import AsyncConfig, Config, main
+import trivia_env
+from tinker_cookbook.rl.train import AsyncConfig, Config, KLReferenceConfig, main
 from tinker_cookbook.rl.types import RLDatasetBuilder
 
 logger = logging.getLogger(__name__)
@@ -24,6 +22,12 @@ class CLIConfig:
     renderer_name: str | None = "gpt_oss_low_reasoning"
     load_checkpoint_path: str | None = None
 
+    # Optional prefill for the answer generation (e.g. "The answer is"),
+    # appended right after the thinking block. Pass
+    # renderer_name=gpt_oss_no_reasoning alongside this to force an empty
+    # thinking block first (see trivia_env.build_gpt_oss_no_reasoning_renderer).
+    prefill: str | None = None
+
     # Environment configuration
     env: str = "trivia"
     seed: int = 0  # Random seed for data shuffling
@@ -32,7 +36,7 @@ class CLIConfig:
     group_size: int = 8
     groups_per_batch: int = 32
     learning_rate: float = 2e-5
-    max_tokens: int = 1028
+    max_tokens: int = 2048
     kl_penalty_coef: float = 0.01
 
     # Number of optimizer steps per training iteration.
@@ -41,7 +45,7 @@ class CLIConfig:
 
     # Logging configuration
     log_path: str | None = None  # If None, uses /tmp/tinker-examples/trivia_rl/{run_name}
-    wandb_project: str | None = "triviaqa-rl"
+    wandb_project: str | None = "triviaqa-rl-nemotron3"
     wandb_name: str | None = None  # If None, uses auto-generated run_name
     compute_post_kl: bool = False
 
@@ -50,6 +54,9 @@ class CLIConfig:
 
     # Checkpointing
     save_every: int = 20
+    # TTL for periodic (non-final) checkpoints; the final checkpoint is
+    # always kept indefinitely by tinker_cookbook regardless of this value.
+    ttl_seconds: int | None = 7 * 24 * 60 * 60  # 7 days
 
     # Service configuration
     base_url: str | None = None
@@ -58,6 +65,8 @@ class CLIConfig:
 
     max_steps_off_policy: int | None = None
     loss_fn: Literal["importance_sampling", "ppo"] = "importance_sampling"
+    # Cap run length; override explicitly if a longer run is really needed.
+    max_steps: int | None = 1200
 
 
 def get_dataset_builder(
@@ -67,13 +76,15 @@ def get_dataset_builder(
     renderer_name: str,
     group_size: int,
     seed: int = 0,
+    prefill: str | None = None,
 ) -> RLDatasetBuilder:
     return trivia_env.get_triviaqa_dataset_builder(
         batch_size=batch_size,
         model_name_for_tokenizer=model_name,
         renderer_name=renderer_name,
         group_size=group_size,
-        seed=seed
+        seed=seed,
+        prefill=prefill,
     )
 
 
@@ -90,7 +101,7 @@ async def cli_main(cli_config: CLIConfig):
     if cli_config.log_path is not None:
         log_path = cli_config.log_path
     else:
-        log_path = f"/tmp/tinker-examples/trivia_rl/{run_name}"
+        log_path = f"logs/{run_name}"
 
     if cli_config.wandb_name is not None:
         wandb_name = cli_config.wandb_name
@@ -106,6 +117,7 @@ async def cli_main(cli_config: CLIConfig):
             renderer_name=renderer_name,
             group_size=cli_config.group_size,
             seed=cli_config.seed,
+            prefill=cli_config.prefill,
         ),
         model_name=cli_config.model_name,
         lora_rank=cli_config.lora_rank,
@@ -117,9 +129,14 @@ async def cli_main(cli_config: CLIConfig):
         load_checkpoint_path=cli_config.load_checkpoint_path,
         compute_post_kl=cli_config.compute_post_kl,
         kl_penalty_coef=cli_config.kl_penalty_coef,
+        kl_reference_config=KLReferenceConfig(
+            base_model=cli_config.model_name,
+            load_checkpoint_path=None,
+        ) if cli_config.kl_penalty_coef > 0 else None,
         num_substeps=cli_config.num_substeps,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
+        ttl_seconds=cli_config.ttl_seconds,
         async_config=AsyncConfig(
             max_steps_off_policy=cli_config.max_steps_off_policy,
             groups_per_batch=cli_config.groups_per_batch,
@@ -127,6 +144,7 @@ async def cli_main(cli_config: CLIConfig):
         if cli_config.max_steps_off_policy is not None
         else None,
         loss_fn=cli_config.loss_fn,
+        max_steps=cli_config.max_steps,
     )
 
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)
