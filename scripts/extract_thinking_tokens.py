@@ -7,7 +7,6 @@ import re
 import json
 import argparse
 from pathlib import Path
-from transformers import AutoTokenizer
 from tinker_cookbook import tokenizer_utils
 
 
@@ -15,10 +14,6 @@ def get_tokenizer(model_type):
     """Load the appropriate tokenizer for each model type."""
     if model_type == "gpt-oss-20b":
         return tokenizer_utils.get_tokenizer('openai/gpt-oss-20b')
-    elif model_type == "olmo-3-7b-think":
-        return AutoTokenizer.from_pretrained("allenai/Olmo-3-7B-Think")
-    elif model_type == "r1-distill-qwen-1.5b":
-        return AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -36,17 +31,6 @@ def extract_thinking_text(raw_prediction, model_type):
             return match.group(1)
         return ""
 
-    elif model_type in ["olmo-3-7b-think", "r1-distill-qwen-1.5b"]:
-        # Format: ...thinking...</think>
-        # Extract everything BEFORE </think> (not including the tag)
-        # Note: newlines after </think> vary (\n\n or \n), so just match up to </think>
-        match = re.search(r'^(.*?)(?=</think>)', raw_prediction, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1)
-        # If no </think> tag found, model hit token limit while still thinking
-        # Treat entire output as thinking
-        return raw_prediction
-
     return ""
 
 
@@ -55,10 +39,6 @@ def detect_model_type(filepath):
     filename = Path(filepath).name.lower()
     if "gptoss" in filename or "gpt-oss" in filename:
         return "gpt-oss-20b"
-    elif "olmo" in filename:
-        return "olmo-3-7b-think"
-    elif "r1qwen" in filename:
-        return "r1-distill-qwen-1.5b"
     return None
 
 
@@ -191,7 +171,7 @@ def process_directory(results_dir, model_type=None, use_tokenizer=True):
 def main():
     parser = argparse.ArgumentParser(description="Extract thinking token counts from evaluation results")
     parser.add_argument("input", type=str, help="Path to results JSON file or directory")
-    parser.add_argument("--model-type", type=str, choices=["gpt-oss-20b", "olmo", "r1-qwen"],
+    parser.add_argument("--model-type", type=str, choices=["gpt-oss-20b"],
                         help="Model type (auto-detected from filename if not specified)")
     parser.add_argument("--no-tokenizer", action="store_true",
                         help="Skip tokenizer, only compute character counts")
