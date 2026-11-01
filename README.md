@@ -411,11 +411,15 @@ results/
 │   ├── nemotron3/
 │   └── qwen3-8b/
 ├── StrategyQA/
-│   └── gpt-oss-20b/
+│   ├── gpt-oss-20b/
+│   ├── nemotron3/
+│   └── qwen3-8b/
 ├── MATH/
 │   ├── gpt-oss-20b/
 │   ├── nemotron3/
 │   └── qwen3-8b/
 └── AIME/
-    └── gpt-oss-20b/
+    ├── gpt-oss-20b/
+    ├── nemotron3/
+    └── qwen3-8b/
 ```
